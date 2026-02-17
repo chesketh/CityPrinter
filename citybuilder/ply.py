@@ -93,20 +93,19 @@ PEG_POSITIONS_FRACTION = [
 
 
 def _make_watertight(mesh: trimesh.Trimesh, min_thickness: float = 0.5) -> Optional[trimesh.Trimesh]:
-    """Attempt to make a mesh watertight/manifold for 3D printing.
+    """Make a mesh watertight/manifold for 3D printing.
 
-    Steps:
-    1. Merge duplicate vertices
-    2. Remove degenerate faces
-    3. Fill holes
-    4. Fix normals
-    5. Check if manifold; if not, try convex hull as fallback
+    Strategy:
+    1. Basic cleanup (merge verts, remove degenerates, fill holes)
+    2. If still non-manifold, try manifold3d (gold standard)
+    3. If manifold3d fails, try voxel remesh
+    4. Last resort: return cleaned mesh (most slicers handle minor issues)
     """
     if mesh is None or len(mesh.faces) == 0:
         return None
 
     try:
-        # Merge close vertices
+        # ── Step 1: Basic cleanup ──
         mesh.merge_vertices(merge_tex=True, merge_norm=True)
 
         # Remove degenerate/duplicate faces
@@ -116,7 +115,7 @@ def _make_watertight(mesh: trimesh.Trimesh, min_thickness: float = 0.5) -> Optio
             mesh.remove_duplicate_faces()
         mesh.remove_unreferenced_vertices()
 
-        # Update face mask for degenerate triangles (area ~0)
+        # Remove zero-area faces
         try:
             face_mask = mesh.area_faces > 1e-10
             if not face_mask.all():
@@ -127,7 +126,7 @@ def _make_watertight(mesh: trimesh.Trimesh, min_thickness: float = 0.5) -> Optio
         if len(mesh.faces) == 0:
             return None
 
-        # Fill holes
+        # Fill holes and fix normals
         trimesh.repair.fill_holes(mesh)
         trimesh.repair.fix_inversion(mesh)
         trimesh.repair.fix_normals(mesh)
@@ -136,21 +135,111 @@ def _make_watertight(mesh: trimesh.Trimesh, min_thickness: float = 0.5) -> Optio
         if mesh.is_watertight:
             return mesh
 
-        # If still not watertight, try voxel remesh approach
-        # Fall back to convex hull only for small decorative objects
-        if mesh.volume < 1.0:
-            try:
-                hull = mesh.convex_hull
-                if hull.is_watertight:
-                    return hull
-            except Exception:
-                pass
+        # ── Step 2: manifold3d repair ──
+        try:
+            import manifold3d
+            manifold = manifold3d.Manifold(
+                mesh=manifold3d.Mesh(
+                    vert_properties=np.array(mesh.vertices, dtype=np.float32),
+                    tri_verts=np.array(mesh.faces, dtype=np.uint32),
+                )
+            )
+            out_mesh = manifold.to_mesh()
+            result = trimesh.Trimesh(
+                vertices=out_mesh.vert_properties[:, :3],
+                faces=out_mesh.tri_verts,
+            )
+            if result.is_watertight and len(result.faces) > 0:
+                logger.info(f"  manifold3d repair: {len(mesh.faces)} → {len(result.faces)} faces")
+                return result
+        except Exception as e:
+            logger.debug(f"manifold3d repair failed: {e}")
 
-        # Return as-is — most slicers can handle minor non-manifold issues
+        # ── Step 3: Voxel remesh ──
+        try:
+            extents = mesh.bounding_box.extents
+            # Target ~150 voxels along longest axis (balance detail vs speed)
+            pitch = max(extents) / 150
+            pitch = max(pitch, 0.3)     # minimum 0.3m resolution
+            pitch = min(pitch, 5.0)     # maximum 5m for huge meshes
+            vox = mesh.voxelized(pitch)
+            if hasattr(vox, 'fill'):
+                vox = vox.fill()  # fill internal voids
+            result = vox.marching_cubes
+            if result.is_watertight and len(result.faces) > 0:
+                logger.info(f"  voxel remesh: {len(mesh.faces)} → {len(result.faces)} faces "
+                            f"(pitch={pitch:.1f})")
+                return result
+        except Exception as e:
+            logger.debug(f"Voxel remesh failed: {e}")
+
+        # ── Step 4: Return as-is ──
+        logger.warning(f"  Could not make watertight ({len(mesh.faces)} faces) — "
+                       f"returning cleaned mesh")
         return mesh
 
     except Exception as e:
         logger.warning(f"Watertight repair failed: {e}")
+        return mesh
+
+
+def _solidify_surface(mesh: trimesh.Trimesh, thickness: float = 2.0) -> trimesh.Trimesh:
+    """Turn an open surface mesh into a solid slab by extruding downward.
+
+    For terrain/water/road surfaces that are just a top sheet with no
+    bottom, this creates a copy offset downward and stitches the edges
+    to form a closed solid.
+    """
+    if mesh is None or len(mesh.faces) == 0:
+        return mesh
+
+    if mesh.is_watertight:
+        return mesh  # already solid
+
+    try:
+        verts = np.array(mesh.vertices)
+        faces = np.array(mesh.faces)
+        n_verts = len(verts)
+
+        # Create bottom surface: offset Y (up axis) downward
+        bottom_verts = verts.copy()
+        bottom_verts[:, 1] -= thickness
+
+        # Bottom faces: reversed winding for outward normals
+        bottom_faces = faces[:, ::-1] + n_verts
+
+        # Stitch boundary edges
+        # Find boundary edges (edges that appear in only one face)
+        edges = set()
+        edge_count = {}
+        for f in faces:
+            for i in range(3):
+                e = (min(f[i], f[(i+1)%3]), max(f[i], f[(i+1)%3]))
+                edge_count[e] = edge_count.get(e, 0) + 1
+        boundary_edges = [(a, b) for (a, b), c in edge_count.items() if c == 1]
+
+        # Create side walls from boundary edges
+        side_faces = []
+        for a, b in boundary_edges:
+            # Top edge: a, b  →  Bottom edge: a+n, b+n
+            side_faces.append([a, b, b + n_verts])
+            side_faces.append([a, b + n_verts, a + n_verts])
+
+        # Combine all
+        all_verts = np.vstack([verts, bottom_verts])
+        all_faces = np.vstack([faces, bottom_faces] +
+                              ([np.array(side_faces)] if side_faces else []))
+
+        result = trimesh.Trimesh(vertices=all_verts, faces=all_faces)
+        result.merge_vertices()
+        trimesh.repair.fix_normals(result)
+
+        logger.info(f"  solidified: {len(faces)} → {len(result.faces)} faces "
+                    f"(thickness={thickness})")
+        return result
+
+    except Exception as e:
+        logger.warning(f"Solidify failed: {e}")
         return mesh
 
 
@@ -323,6 +412,11 @@ def generate_ply_layers(glb_path: str, output_dir: str,
                 mesh = parts[0].copy()
             else:
                 mesh = trimesh.util.concatenate(parts)
+
+            # Solidify open surfaces (terrain, water, roads, details)
+            # These are flat/curved sheets that need thickness for printing
+            if layer_name in ('terrain', 'water', 'roads', 'details'):
+                mesh = _solidify_surface(mesh, thickness=2.0)
 
             # Make watertight
             mesh = _make_watertight(mesh, min_thickness)
