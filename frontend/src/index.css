@@ -1,0 +1,34 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Leaflet overrides (cannot be expressed as Tailwind utilities) */
+.leaflet-draw-toolbar a {
+  background-color: #fff;
+}
+.leaflet-control-zoom a {
+  color: #333;
+}
+
+@layer components {
+  .manual-bbox-input {
+    @apply px-2 py-1 rounded border border-ctp-surface1 bg-ctp-base text-ctp-text
+           text-xs font-mono outline-none w-full
+           focus:border-ctp-blue focus:ring-1 focus:ring-ctp-blue/30
+           transition-colors duration-150 disabled:opacity-50;
+  }
+}
+
+@layer utilities {
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: #45475a transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background-color: #45475a;
+    border-radius: 3px;
+  }
+}
