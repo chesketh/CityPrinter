@@ -323,6 +323,214 @@ def _add_peg_holes(mesh: trimesh.Trimesh, scene_bounds) -> trimesh.Trimesh:
     return mesh
 
 
+def generate_ply_single(glb_path: str, output_path: str,
+                        name: str = "city",
+                        scale: float = 1.0,
+                        progress_callback=None) -> dict:
+    """Generate a single watertight PLY from a GLB.
+
+    All feature meshes are color-coded by type and merged into one PLY file.
+    The merged mesh is solidified and repaired to be watertight.
+
+    Parameters
+    ----------
+    glb_path : str
+        Path to the source GLB file.
+    output_path : str
+        Path for the output PLY file.
+    name : str
+        Model name for metadata.
+    scale : float
+        Scale factor (1.0 = meters).
+    progress_callback : callable
+        Optional (pct, msg) callback.
+
+    Returns
+    -------
+    dict with output_path, faces, vertices, watertight.
+    """
+    def _progress(pct, msg):
+        if progress_callback:
+            progress_callback(pct, msg)
+
+    _progress(0, "Loading GLB...")
+    t0 = time.perf_counter()
+
+    scene = trimesh.load(glb_path, force='scene')
+    if not isinstance(scene, trimesh.Scene):
+        scene = trimesh.Scene(geometry={'model': scene})
+
+    # Build a reverse map: GLB group name → layer color
+    group_to_color = {}
+    for layer_name, layer_def in PRINT_LAYERS.items():
+        color = layer_def['color']
+        for grp in layer_def.get('glb_groups', []):
+            group_to_color[grp] = color
+
+    _progress(10, "Coloring meshes...")
+
+    colored_parts = []
+    for geom_name, geom in scene.geometry.items():
+        if not isinstance(geom, trimesh.Trimesh) or len(geom.faces) == 0:
+            continue
+
+        mesh = geom.copy()
+
+        # Get color for this group (default: light gray)
+        color_rgb = group_to_color.get(geom_name, [180, 180, 180])
+
+        # Assign solid vertex color
+        rgba = np.array([color_rgb[0], color_rgb[1], color_rgb[2], 255],
+                        dtype=np.uint8)
+        mesh.visual = trimesh.visual.ColorVisuals(
+            mesh=mesh,
+            vertex_colors=np.tile(rgba, (len(mesh.vertices), 1))
+        )
+
+        # Solidify ALL open surfaces — every mesh needs to be a closed volume
+        if not mesh.is_watertight:
+            mesh = _solidify_surface(mesh, thickness=2.0)
+            # Re-apply color after solidify (adds new verts)
+            mesh.visual = trimesh.visual.ColorVisuals(
+                mesh=mesh,
+                vertex_colors=np.tile(rgba, (len(mesh.vertices), 1))
+            )
+
+        colored_parts.append(mesh)
+        logger.info(f"  {geom_name}: {len(mesh.faces)} faces, "
+                    f"color={color_rgb}")
+
+    if not colored_parts:
+        raise ValueError("No geometry found in GLB")
+
+    _progress(40, f"Merging {len(colored_parts)} meshes...")
+
+    # Concatenate all parts — this preserves vertex colors
+    merged = trimesh.util.concatenate(colored_parts)
+    logger.info(f"Merged: {len(merged.faces)} faces, "
+                f"{len(merged.vertices)} verts")
+
+    _progress(60, "Repairing mesh...")
+
+    # Basic cleanup
+    merged.merge_vertices(merge_tex=False, merge_norm=False)
+    merged.remove_unreferenced_vertices()
+    try:
+        face_mask = merged.area_faces > 1e-10
+        if not face_mask.all():
+            merged.update_faces(face_mask)
+    except Exception:
+        pass
+    trimesh.repair.fill_holes(merged)
+    trimesh.repair.fix_normals(merged)
+    trimesh.repair.fix_winding(merged)
+
+    logger.info(f"After repair: {len(merged.faces)} faces, "
+                f"watertight={merged.is_watertight}")
+
+    # Try to make watertight — try multiple strategies
+    if not merged.is_watertight:
+        _progress(75, "Running manifold repair...")
+
+        # Save colors for re-assignment after repair
+        orig_verts = np.array(merged.vertices)
+        try:
+            orig_colors = np.array(merged.visual.vertex_colors)
+        except Exception:
+            orig_colors = np.full((len(orig_verts), 4), 200, dtype=np.uint8)
+
+        def _recolor(repaired_mesh):
+            """Re-assign colors to repaired mesh via nearest-neighbor."""
+            from scipy.spatial import KDTree
+            tree = KDTree(orig_verts)
+            _, idx = tree.query(np.array(repaired_mesh.vertices))
+            new_colors = orig_colors[idx]
+            repaired_mesh.visual = trimesh.visual.ColorVisuals(
+                mesh=repaired_mesh, vertex_colors=new_colors)
+            return repaired_mesh
+
+        # Strategy 1: manifold3d
+        try:
+            import manifold3d
+            manifold = manifold3d.Manifold(
+                mesh=manifold3d.Mesh(
+                    vert_properties=np.array(merged.vertices, dtype=np.float32),
+                    tri_verts=np.array(merged.faces, dtype=np.uint32),
+                )
+            )
+            out_mesh = manifold.to_mesh()
+            repaired = trimesh.Trimesh(
+                vertices=out_mesh.vert_properties[:, :3],
+                faces=out_mesh.tri_verts,
+            )
+            if repaired.is_watertight and len(repaired.faces) > 0:
+                logger.info(f"manifold3d: {len(merged.faces)} → "
+                            f"{len(repaired.faces)} faces ✓")
+                merged = _recolor(repaired)
+            else:
+                logger.warning("manifold3d: not watertight, trying voxel...")
+                raise ValueError("not watertight")
+        except Exception as e:
+            logger.warning(f"manifold3d failed ({e}), trying voxel remesh...")
+
+            # Strategy 2: voxel remesh — guaranteed watertight
+            try:
+                _progress(82, "Voxel remesh (may take a moment)...")
+                extents = merged.bounding_box.extents
+                pitch = max(extents) / 200  # 200 voxels along longest axis
+                pitch = max(pitch, 0.5)
+                pitch = min(pitch, 4.0)
+                logger.info(f"Voxelizing at pitch={pitch:.2f}m...")
+                vox = merged.voxelized(pitch).fill()
+                result = vox.marching_cubes
+                if result.is_watertight and len(result.faces) > 0:
+                    logger.info(f"Voxel remesh: {len(merged.faces)} → "
+                                f"{len(result.faces)} faces ✓")
+                    # Simplify — target 100k faces max, preserve color
+                    if len(result.faces) > 150000:
+                        _progress(88, "Simplifying mesh...")
+                        target = min(len(result.faces), 100000)
+                        simplified = result.simplify_quadric_decimation(target)
+                        if simplified.is_watertight and len(simplified.faces) > 0:
+                            logger.info(f"Simplified: {len(result.faces)} → "
+                                        f"{len(simplified.faces)} faces")
+                            result = simplified
+                    merged = _recolor(result)
+                else:
+                    logger.warning("Voxel remesh not watertight either")
+            except Exception as e2:
+                logger.warning(f"Voxel remesh failed ({e2}), exporting as-is")
+
+    _progress(90, "Exporting PLY...")
+
+    out = pathlib.Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if scale != 1.0:
+        merged.apply_scale(scale)
+
+    merged.export(str(out), file_type='ply')
+
+    elapsed = time.perf_counter() - t0
+    size_mb = out.stat().st_size / 1024 / 1024
+    watertight = merged.is_watertight
+
+    logger.info(f"{'✓' if watertight else '✗'} {out.name}: "
+                f"{len(merged.faces)} faces, "
+                f"{'watertight' if watertight else 'non-manifold'}, "
+                f"{size_mb:.1f} MB, {elapsed:.1f}s")
+
+    _progress(100, "Done!")
+    return {
+        'output_path': str(out),
+        'faces': len(merged.faces),
+        'vertices': len(merged.vertices),
+        'watertight': watertight,
+        'size_mb': round(size_mb, 2),
+        'elapsed_seconds': round(elapsed, 1),
+    }
+
+
 def generate_ply_layers(glb_path: str, output_dir: str,
                         name: str = "city",
                         scale: float = 1.0,

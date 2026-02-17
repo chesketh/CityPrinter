@@ -233,6 +233,24 @@ class CityBuilder:
 
         return result
 
+    def generate_ply_single(self, city_id: int, output_path: str,
+                            name: str = "city", scale: float = 1.0,
+                            progress_callback=None) -> dict:
+        """Generate a single watertight PLY from a city build.
+
+        All feature meshes are color-coded and merged into one file.
+        """
+        glb_path = self.generate_glb(city_id, output_path,
+                                     progress_callback=progress_callback)
+        ply_path = str(pathlib.Path(glb_path).with_suffix('.ply'))
+        return ply_mod.generate_ply_single(
+            glb_path=glb_path,
+            output_path=ply_path,
+            name=name,
+            scale=scale,
+            progress_callback=progress_callback,
+        )
+
     def generate_ply(self, city_id: int, output_path: str,
                      name: str = "city", scale: float = 1.0,
                      progress_callback=None) -> dict:

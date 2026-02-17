@@ -185,13 +185,31 @@ export default function App() {
     </>
   )
 
-  const isPlyResult = job?.status === 'completed' && job.result?.format === 'ply' && job.result?.layers
-  
+  const isPlyResult = job?.status === 'completed' && job.result?.format === 'ply'
+
   const rightPanel = isPlyResult ? (
-    <PrintLayerViewer
-      layers={job!.result!.layers!}
-      outputDir={job!.result!.output_dir || '/output/'}
-    />
+    <div className="flex flex-col items-center justify-center gap-5 p-10 text-center">
+      <div className="text-5xl">🖨️</div>
+      <div>
+        <div className="text-lg font-bold text-ctp-text mb-1">Print-Ready PLY Generated</div>
+        <div className="text-sm text-ctp-subtext0 mb-4">
+          Single watertight mesh · {job!.result!.faces?.toLocaleString()} faces ·{' '}
+          {job!.result!.size_mb} MB ·{' '}
+          <span className={job!.result!.watertight ? 'text-ctp-green' : 'text-ctp-yellow'}>
+            {job!.result!.watertight ? '✓ watertight' : '⚠ non-manifold'}
+          </span>
+        </div>
+        <a
+          href={job!.result!.model_url}
+          download
+          className="px-6 py-2.5 rounded-lg text-sm font-bold
+                     bg-ctp-green text-ctp-base hover:bg-ctp-green/80
+                     transition-colors duration-150"
+        >
+          ↓ Download PLY
+        </a>
+      </div>
+    </div>
   ) : modelUrl ? (
     <ModelViewer url={modelUrl} />
   ) : (

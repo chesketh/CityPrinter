@@ -54,16 +54,20 @@ def _sync_build(north: float, south: float, east: float, west: float,
 
     if output_format == "ply":
         safe_name = output_filename.replace('.glb', '').replace('.ply', '')
-        ply_result = builder.generate_ply(
+        ply_result = builder.generate_ply_single(
             city_id, output_filename,
             name=safe_name, scale=scale,
             progress_callback=progress_callback)
+        ply_filename = safe_name + '.ply'
         return {
             "city_id": city_id,
             "format": "ply",
-            "layers": ply_result['layers'],
-            "manifest_url": f"/output/{safe_name}_print/manifest.json",
-            "output_dir": f"/output/{safe_name}_print/",
+            "ply_path": ply_result['output_path'],
+            "model_url": f"/output/{ply_filename}",
+            "faces": ply_result['faces'],
+            "vertices": ply_result['vertices'],
+            "watertight": ply_result['watertight'],
+            "size_mb": ply_result['size_mb'],
         }
     else:
         glb_path = builder.generate_glb(city_id, output_filename,
