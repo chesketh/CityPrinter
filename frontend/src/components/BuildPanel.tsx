@@ -16,12 +16,12 @@ interface BuildPanelProps {
   bbox: BoundingBox | null
   job: JobStatus | null
   searchResult: GeocodeResult | null
-  outputFormat: 'glb' | 'ply'
+  outputFormat: 'glb' | 'ply' | '3mf'
   onSearch: (query: string) => void
   onBuild: () => void
   onBboxChange: (bbox: BoundingBox | null) => void
   onSelectPreset: (preset: Preset) => void
-  onFormatChange: (format: 'glb' | 'ply') => void
+  onFormatChange: (format: 'glb' | 'ply' | '3mf') => void
   disabled: boolean
 }
 
@@ -123,7 +123,18 @@ export default function BuildPanel({
             onClick={() => onFormatChange('ply')}
             disabled={!!isBuilding}
           >
-            🖨️ Print PLY
+            🖨️ PLY
+          </button>
+          <button
+            className={`px-3 py-1 text-xs font-semibold transition-colors duration-150 ${
+              outputFormat === '3mf'
+                ? 'bg-ctp-peach text-ctp-base'
+                : 'bg-ctp-surface0 text-ctp-subtext0 hover:bg-ctp-surface1'
+            }`}
+            onClick={() => onFormatChange('3mf')}
+            disabled={!!isBuilding}
+          >
+            🎨 3MF
           </button>
         </div>
       </div>

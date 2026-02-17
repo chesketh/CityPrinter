@@ -52,7 +52,24 @@ def _sync_build(north: float, south: float, east: float, west: float,
     builder = CityBuilder(use_cache=_cfg.USE_CACHE)
     city_id = asyncio.run(builder.process_city(bbox, progress_callback=progress_callback))
 
-    if output_format == "ply":
+    if output_format == "3mf":
+        safe_name = output_filename.replace('.glb', '')
+        tmf_result = builder.generate_3mf(
+            city_id, output_filename,
+            name=safe_name, scale=scale,
+            progress_callback=progress_callback)
+        tmf_filename = safe_name + '.3mf'
+        return {
+            "city_id": city_id,
+            "format": "3mf",
+            "model_url": f"/output/{tmf_filename}",
+            "layers": tmf_result['layers'],
+            "total_faces": tmf_result['total_faces'],
+            "watertight_count": tmf_result['watertight_count'],
+            "total_layers": tmf_result['total_layers'],
+            "size_mb": tmf_result['size_mb'],
+        }
+    elif output_format == "ply":
         safe_name = output_filename.replace('.glb', '').replace('.ply', '')
         ply_result = builder.generate_ply_single(
             city_id, output_filename,

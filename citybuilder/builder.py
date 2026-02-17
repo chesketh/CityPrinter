@@ -18,6 +18,7 @@ from .models import BoundingBox
 from . import osm_data
 from . import glb as glb_mod
 from . import ply as ply_mod
+from . import export_3mf as tmf_mod
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +233,21 @@ class CityBuilder:
                 logger.warning(f"Failed to cache GLB: {e}")
 
         return result
+
+    def generate_3mf(self, city_id: int, output_path: str,
+                     name: str = "city", scale: float = 1.0,
+                     progress_callback=None) -> dict:
+        """Generate a multi-body 3MF for multi-color printing."""
+        glb_path = self.generate_glb(city_id, output_path,
+                                     progress_callback=progress_callback)
+        tmf_path = str(pathlib.Path(glb_path).with_suffix('.3mf'))
+        return tmf_mod.generate_3mf(
+            glb_path=glb_path,
+            output_path=tmf_path,
+            name=name,
+            scale=scale,
+            progress_callback=progress_callback,
+        )
 
     def generate_ply_single(self, city_id: int, output_path: str,
                             name: str = "city", scale: float = 1.0,

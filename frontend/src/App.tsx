@@ -13,7 +13,7 @@ export default function App() {
   const [modelUrl, setModelUrl] = useState<string | null>(null)
   const [searchResult, setSearchResult] = useState<GeocodeResult | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [outputFormat, setOutputFormat] = useState<'glb' | 'ply'>('glb')
+  const [outputFormat, setOutputFormat] = useState<'glb' | 'ply' | '3mf'>('glb')
 
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -186,8 +186,42 @@ export default function App() {
   )
 
   const isPlyResult = job?.status === 'completed' && job.result?.format === 'ply'
+  const is3mfResult = job?.status === 'completed' && job.result?.format === '3mf'
 
-  const rightPanel = isPlyResult ? (
+  const rightPanel = is3mfResult ? (
+    <div className="flex flex-col items-center justify-center gap-5 p-10 text-center">
+      <div className="text-5xl">🎨</div>
+      <div>
+        <div className="text-lg font-bold text-ctp-text mb-1">Multi-Color 3MF Ready</div>
+        <div className="text-sm text-ctp-subtext0 mb-2">
+          {job!.result!.total_layers} layers · {job!.result!.total_faces?.toLocaleString()} faces ·{' '}
+          {job!.result!.size_mb} MB ·{' '}
+          <span className="text-ctp-green">{job!.result!.watertight_count}/{job!.result!.total_layers} watertight</span>
+        </div>
+        <div className="flex flex-wrap justify-center gap-2 mb-4">
+          {(job!.result!.layers || []).map((l: any) => (
+            <span key={l.name} className="flex items-center gap-1.5 text-xs px-2 py-1 rounded-full bg-ctp-surface1">
+              <span className="w-3 h-3 rounded-full border border-ctp-surface2 flex-shrink-0"
+                    style={{backgroundColor: `rgb(${l.color[0]},${l.color[1]},${l.color[2]})`}} />
+              {l.name}
+            </span>
+          ))}
+        </div>
+        <a
+          href={job!.result!.model_url}
+          download
+          className="px-6 py-2.5 rounded-lg text-sm font-bold
+                     bg-ctp-peach text-ctp-base hover:bg-ctp-peach/80
+                     transition-colors duration-150"
+        >
+          ↓ Download 3MF
+        </a>
+        <p className="text-xs text-ctp-overlay0 mt-3">
+          Open in PrusaSlicer or Bambu Studio → assign one filament per layer
+        </p>
+      </div>
+    </div>
+  ) : isPlyResult ? (
     <div className="flex flex-col items-center justify-center gap-5 p-10 text-center">
       <div className="text-5xl">🖨️</div>
       <div>
@@ -199,13 +233,8 @@ export default function App() {
             {job!.result!.watertight ? '✓ watertight' : '⚠ non-manifold'}
           </span>
         </div>
-        <a
-          href={job!.result!.model_url}
-          download
-          className="px-6 py-2.5 rounded-lg text-sm font-bold
-                     bg-ctp-green text-ctp-base hover:bg-ctp-green/80
-                     transition-colors duration-150"
-        >
+        <a href={job!.result!.model_url} download
+          className="px-6 py-2.5 rounded-lg text-sm font-bold bg-ctp-green text-ctp-base hover:bg-ctp-green/80 transition-colors duration-150">
           ↓ Download PLY
         </a>
       </div>

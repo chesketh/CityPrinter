@@ -4,7 +4,7 @@ from typing import Optional
 
 class BuildByNameRequest(BaseModel):
     location: str
-    output_format: str = "glb"  # "glb" or "ply"
+    output_format: str = "glb"  # "glb", "ply", or "3mf"
     scale: float = 1.0          # scale factor for PLY (e.g. 0.001 for m→mm)
 
 
