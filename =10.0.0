@@ -1,0 +1,6 @@
+Defaulting to user installation because normal site-packages is not writeable
+Looking in indexes: https://pypi.org/simple, https://pypi.ngc.nvidia.com
+Requirement already satisfied: Pillow in c:\users\chesk\appdata\roaming\python\python313\site-packages (10.4.0)
+
+[notice] A new release of pip is available: 25.0.1 -> 26.0.1
+[notice] To update, run: python.exe -m pip install --upgrade pip
