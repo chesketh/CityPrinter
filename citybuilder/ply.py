@@ -954,8 +954,13 @@ def _create_buildings_layer(building_meshes: list, terrain_y_min: float,
             hull = ConvexHull(xz)
             hull_pts = xz[hull.vertices].astype(np.float64)
 
+            # Expand footprint slightly (0.1%) to prevent T-junction artifacts
+            # from exactly-coincident edges between adjacent buildings
+            centroid = hull_pts.mean(axis=0)
+            hull_pts = centroid + (hull_pts - centroid) * 1.001
+
             # Create cross-section from convex hull
-            cs = manifold3d.CrossSection([hull_pts])
+            cs = manifold3d.CrossSection([hull_pts.tolist()])
             # Extrude from shell_bottom to building top
             building_solid = manifold3d.Manifold.extrude(cs, height)
             building_solid = building_solid.translate([0, 0, shell_bottom])
