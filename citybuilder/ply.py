@@ -720,3 +720,509 @@ def generate_ply_layers(glb_path: str, output_dir: str,
         'manifest_path': str(manifest_path),
         'output_dir': str(out),
     }
+
+
+# ── V2 Layer System ──────────────────────────────────────────────────
+# Interlocking layers: terrain has building-shaped holes,
+# buildings sit on a thin shell that fits under terrain.
+#
+# Stack (bottom → top):
+#   1. Water — flat base, blue
+#   2. Buildings — thin shell base + extruded buildings (white)
+#   3. Terrain — green with building footprint holes punched through
+#   4. Roads — thin gray surface on top of terrain
+# ─────────────────────────────────────────────────────────────────────
+
+# Which GLB groups belong to each v2 layer
+V2_BUILDING_GROUPS = [
+    'building', 'foundation', 'wall', 'windows',
+    'statue', 'torch', 'shells',
+    'cn_shaft', 'cn_pod', 'brandenburg_gate',
+]
+V2_TERRAIN_GROUPS = ['terrain', 'green', 'rock', 'glacier']
+V2_WATER_GROUPS = ['blue_base', 'wave']
+V2_ROAD_GROUPS = ['road', 'bridge', 'railway', 'paved', 'track']
+
+# Tolerance for building holes in terrain (mm in model units)
+HOLE_TOLERANCE = 0.2
+
+# Colors
+V2_COLORS = {
+    'water':     [64, 133, 217],   # blue
+    'buildings': [240, 240, 240],   # white
+    'terrain':   [120, 160, 80],    # earth green
+    'roads':     [65, 65, 65],      # dark asphalt
+}
+
+
+def _trimesh_to_manifold(mesh: trimesh.Trimesh):
+    """Convert a trimesh to a manifold3d Manifold, swapping Y↔Z (Y-up → Z-up).
+
+    The Y↔Z column swap changes chirality, so face winding must be reversed
+    to keep outward normals and positive volume in manifold's coordinate system.
+    """
+    import manifold3d
+    verts = np.array(mesh.vertices, dtype=np.float64)
+    # Swap Y and Z: trimesh Y-up → manifold3d Z-up
+    verts_swapped = verts[:, [0, 2, 1]].copy()
+    # Flip winding to compensate for chirality change
+    faces = np.array(mesh.faces, dtype=np.uint32)[:, ::-1].copy()
+    try:
+        m = manifold3d.Manifold(
+            mesh=manifold3d.Mesh(
+                vert_properties=verts_swapped.astype(np.float32),
+                tri_verts=faces,
+            )
+        )
+        return m
+    except Exception as e:
+        logger.debug(f"trimesh_to_manifold failed: {e}")
+        return None
+
+
+def _manifold_to_trimesh(manifold_obj) -> trimesh.Trimesh:
+    """Convert a manifold3d Manifold back to trimesh, swapping Z↔Y (Z-up → Y-up).
+
+    The Y↔Z column swap is a reflection that changes handedness, so we must
+    also flip face winding to preserve outward normals and get positive volume.
+
+    Uses process=False to prevent trimesh from merging near-coincident vertices,
+    which can create non-manifold edges on complex boolean union results.
+    """
+    out = manifold_obj.to_mesh()
+    verts = np.array(out.vert_properties[:, :3], dtype=np.float64)
+    # Swap back: manifold3d Z-up → trimesh Y-up
+    verts_swapped = verts[:, [0, 2, 1]].copy()
+    # Flip winding: axis swap changes chirality, faces must be reversed
+    faces = np.array(out.tri_verts, dtype=np.uint32)[:, ::-1].copy()
+    return trimesh.Trimesh(vertices=verts_swapped, faces=faces, process=False)
+
+
+def _get_building_footprints_2d(building_meshes: list, terrain_bounds=None,
+                                tolerance: float = HOLE_TOLERANCE,
+                                max_area_fraction: float = 0.15):
+    """Extract 2D XZ footprints from building meshes.
+
+    Only extracts footprints from actual building structures, filtering out
+    island-scale walls/foundations. Deduplicates overlapping footprints.
+
+    Parameters
+    ----------
+    building_meshes : list
+        List of trimesh objects for buildings.
+    terrain_bounds : tuple or None
+        ((xmin,ymin,zmin), (xmax,ymax,zmax)) of terrain — used to filter
+        out footprints that cover too much of the terrain.
+    tolerance : float
+        Clearance to add around each footprint (model units).
+    max_area_fraction : float
+        Skip footprints larger than this fraction of terrain XZ area.
+    """
+    from scipy.spatial import ConvexHull
+
+    # Merge all building meshes
+    merged = trimesh.util.concatenate(building_meshes) if len(building_meshes) > 1 else building_meshes[0].copy()
+
+    # Compute terrain area for filtering
+    if terrain_bounds is not None:
+        terrain_xz_area = ((terrain_bounds[1][0] - terrain_bounds[0][0]) *
+                           (terrain_bounds[1][2] - terrain_bounds[0][2]))
+    else:
+        terrain_xz_area = float('inf')
+    max_footprint_area = terrain_xz_area * max_area_fraction
+
+    # Split into connected components (individual buildings)
+    components = merged.split(only_watertight=False)
+    logger.info(f"  Found {len(components)} building components")
+
+    raw_footprints = []
+    for comp in components:
+        if len(comp.faces) < 4:
+            continue
+        verts = comp.vertices
+        xz = verts[:, [0, 2]]
+        y_min = verts[:, 1].min()
+        y_max = verts[:, 1].max()
+
+        if len(xz) < 3:
+            continue
+
+        try:
+            hull = ConvexHull(xz)
+            hull_pts = xz[hull.vertices]
+
+            # Filter out huge footprints (retaining walls, foundations spanning the island)
+            fp_area = hull.volume  # ConvexHull.volume is area for 2D
+            if fp_area > max_footprint_area:
+                logger.debug(f"  Skipping oversized footprint: {fp_area:.0f} sqm "
+                             f"(max {max_footprint_area:.0f})")
+                continue
+
+            # Expand by tolerance for clearance
+            centroid = hull_pts.mean(axis=0)
+            dist = np.linalg.norm(hull_pts - centroid, axis=1).mean()
+            if dist < 0.01:
+                continue
+            expanded = centroid + (hull_pts - centroid) * (1 + tolerance / dist)
+
+            raw_footprints.append({
+                'polygon': expanded,
+                'centroid': centroid,
+                'area': fp_area,
+                'y_min': float(y_min),
+                'y_max': float(y_max),
+                'faces': len(comp.faces),
+            })
+        except Exception:
+            continue
+
+    # Deduplicate: merge footprints whose centroids are within 1m of each other
+    # (building + foundation + wall fragments that overlap)
+    if raw_footprints:
+        deduped = []
+        used = set()
+        centroids = np.array([fp['centroid'] for fp in raw_footprints])
+        for i, fp in enumerate(raw_footprints):
+            if i in used:
+                continue
+            # Find all footprints within 1m of this centroid
+            dists = np.linalg.norm(centroids - fp['centroid'], axis=1)
+            cluster = np.where(dists < 1.0)[0]
+            # Keep the largest footprint from each cluster
+            best = max(cluster, key=lambda j: raw_footprints[j]['area'])
+            deduped.append(raw_footprints[best])
+            for j in cluster:
+                used.add(j)
+        logger.info(f"  Extracted {len(deduped)} building footprints "
+                    f"(from {len(raw_footprints)} raw, {len(components)} components)")
+        return deduped
+    return []
+
+
+def _create_buildings_layer(building_meshes: list, terrain_y_min: float,
+                            shell_thickness: float = 1.0) -> Optional[trimesh.Trimesh]:
+    """Create the buildings layer: thin connecting shell + extruded buildings.
+
+    The shell sits just below terrain_y_min so terrain can rest on top.
+    Buildings extend upward from the shell through the terrain holes.
+    """
+    import manifold3d
+
+    if not building_meshes:
+        return None
+
+    merged = trimesh.util.concatenate(building_meshes) if len(building_meshes) > 1 else building_meshes[0].copy()
+    bounds = merged.bounds
+    scene_xmin, scene_zmin = bounds[0][0], bounds[0][2]
+    scene_xmax, scene_zmax = bounds[1][0], bounds[1][2]
+
+    # Shell sits below terrain — from (terrain_y_min - shell_thickness) to terrain_y_min
+    shell_bottom = terrain_y_min - shell_thickness
+    shell_top = terrain_y_min
+
+    # Create thin shell plate (in manifold3d coords: XY = our XZ, Z = our Y)
+    margin = 2.0
+    shell_width_x = (scene_xmax - scene_xmin) + 2 * margin
+    shell_width_y = (scene_zmax - scene_zmin) + 2 * margin  # manifold Y = our Z
+
+    shell = manifold3d.Manifold.cube([shell_width_x, shell_width_y, shell_thickness])
+    shell = shell.translate([
+        scene_xmin - margin,
+        scene_zmin - margin,  # manifold Y = our Z
+        shell_bottom,         # manifold Z = our Y
+    ])
+
+    # Add each building as an extruded column from shell to building top
+    components = merged.split(only_watertight=False)
+    buildings_added = 0
+
+    for comp in components:
+        if len(comp.faces) < 4:
+            continue
+
+        verts = comp.vertices
+        xz = verts[:, [0, 2]]  # X, Z → manifold X, Y
+        y_min = verts[:, 1].min()
+        y_max = verts[:, 1].max()
+        height = y_max - shell_bottom
+
+        if height < 0.5 or len(xz) < 3:
+            continue
+
+        try:
+            from scipy.spatial import ConvexHull
+            hull = ConvexHull(xz)
+            hull_pts = xz[hull.vertices].astype(np.float64)
+
+            # Create cross-section from convex hull
+            cs = manifold3d.CrossSection([hull_pts])
+            # Extrude from shell_bottom to building top
+            building_solid = manifold3d.Manifold.extrude(cs, height)
+            building_solid = building_solid.translate([0, 0, shell_bottom])
+
+            shell = shell + building_solid  # boolean union
+            buildings_added += 1
+        except Exception as e:
+            logger.debug(f"  Building extrusion failed: {e}")
+            continue
+
+    logger.info(f"  Buildings layer: {buildings_added} buildings union'd with shell")
+
+    # Convert back to trimesh (swap Z↔Y, flip winding)
+    result = _manifold_to_trimesh(shell)
+    return result
+
+
+def _create_terrain_with_holes(terrain_meshes: list, footprints: list,
+                               thickness: float = 2.0) -> Optional[trimesh.Trimesh]:
+    """Create terrain layer with building footprint holes punched through.
+
+    The terrain is solidified (given thickness), then building footprints
+    are boolean-subtracted as extruded columns.
+    """
+    import manifold3d
+
+    if not terrain_meshes:
+        return None
+
+    merged = trimesh.util.concatenate(terrain_meshes) if len(terrain_meshes) > 1 else terrain_meshes[0].copy()
+
+    # Solidify terrain first (give it thickness)
+    solidified = _solidify_surface(merged, thickness=thickness)
+
+    # Make watertight for boolean ops
+    solidified = _make_watertight(solidified)
+    if solidified is None or len(solidified.faces) == 0:
+        return None
+
+    # Convert to manifold3d (Y↔Z swap)
+    terrain_manifold = _trimesh_to_manifold(solidified)
+    if terrain_manifold is None:
+        logger.warning("  Could not convert terrain to manifold — returning without holes")
+        return solidified
+
+    # Punch building footprint holes through terrain
+    holes_cut = 0
+    terrain_bounds = solidified.bounds
+    punch_bottom = terrain_bounds[0][1] - thickness * 2  # well below terrain
+    punch_top = terrain_bounds[1][1] + thickness * 2     # well above terrain
+    punch_height = punch_top - punch_bottom
+
+    for fp in footprints:
+        try:
+            poly = fp['polygon'].astype(np.float64)
+            if len(poly) < 3:
+                continue
+
+            # CrossSection in manifold3d XY plane (our XZ plane)
+            cs = manifold3d.CrossSection([poly])
+            # Extrude tall enough to punch through entire terrain
+            punch = manifold3d.Manifold.extrude(cs, punch_height)
+            # Position it: manifold Z = our Y
+            punch = punch.translate([0, 0, punch_bottom])
+
+            terrain_manifold = terrain_manifold - punch
+            holes_cut += 1
+        except Exception as e:
+            logger.debug(f"  Hole punch failed: {e}")
+            continue
+
+    logger.info(f"  Terrain: {holes_cut}/{len(footprints)} holes punched")
+
+    # Convert back to trimesh
+    result = _manifold_to_trimesh(terrain_manifold)
+    return result
+
+
+def generate_print_layers_v2(glb_path: str, output_dir: str,
+                             name: str = "city",
+                             scale: float = 1.0,
+                             shell_thickness: float = 1.0,
+                             terrain_thickness: float = 2.0,
+                             progress_callback=None) -> dict:
+    """Generate interlocking PLY layers for 3D printing.
+
+    V2 layer system with building cutouts in terrain:
+      1. Water — blue base layer
+      2. Buildings — thin shell connecting extruded buildings (white)
+      3. Terrain — green with building-shaped holes (fits over buildings)
+      4. Roads — thin gray surface on terrain
+
+    Parameters
+    ----------
+    glb_path : str
+        Path to the source GLB file.
+    output_dir : str
+        Directory to write PLY files and manifest.
+    name : str
+        Base name for output files.
+    scale : float
+        Scale factor (1.0 = original meters).
+    shell_thickness : float
+        Thickness of the thin shell connecting buildings (model units).
+    terrain_thickness : float
+        Thickness of the solidified terrain slab (model units).
+    progress_callback : callable
+        Optional (pct, msg) callback.
+
+    Returns
+    -------
+    dict with 'layers' list and 'manifest_path'.
+    """
+    def _progress(pct, msg):
+        if progress_callback:
+            progress_callback(pct, msg)
+
+    t0 = time.perf_counter()
+    out = pathlib.Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    _progress(0, "Loading GLB model...")
+    scene = trimesh.load(glb_path, force='scene')
+    if not isinstance(scene, trimesh.Scene):
+        scene = trimesh.Scene(geometry={'model': scene})
+
+    # Collect GLB meshes by name
+    glb_meshes = {}
+    for geom_name, geom in scene.geometry.items():
+        if isinstance(geom, trimesh.Trimesh) and len(geom.faces) > 0:
+            glb_meshes[geom_name] = geom
+
+    # Group meshes by layer
+    def _collect(groups):
+        return [glb_meshes[g] for g in groups if g in glb_meshes]
+
+    building_meshes = _collect(V2_BUILDING_GROUPS)
+    terrain_meshes = _collect(V2_TERRAIN_GROUPS)
+    water_meshes = _collect(V2_WATER_GROUPS)
+    road_meshes = _collect(V2_ROAD_GROUPS)
+
+    # Get terrain Y range for shell positioning
+    if terrain_meshes:
+        terrain_merged = trimesh.util.concatenate(terrain_meshes) if len(terrain_meshes) > 1 else terrain_meshes[0]
+        terrain_y_min = float(terrain_merged.bounds[0][1])
+    else:
+        terrain_y_min = 0.0
+
+    results = []
+
+    # ── Layer 1: Water ──
+    _progress(5, "Building water layer...")
+    if water_meshes:
+        water = trimesh.util.concatenate(water_meshes) if len(water_meshes) > 1 else water_meshes[0].copy()
+        water = _solidify_surface(water, thickness=2.0)
+        water = _make_watertight(water)
+        if water is not None and len(water.faces) > 0:
+            water = _assign_solid_color(water, V2_COLORS['water'])
+            if scale != 1.0:
+                water.apply_scale(scale)
+            fp = out / f"{name}_water.ply"
+            water.export(str(fp), file_type='ply')
+            results.append({
+                'layer': 'water', 'file': fp.name,
+                'color_rgb': V2_COLORS['water'],
+                'faces': len(water.faces), 'vertices': len(water.vertices),
+                'watertight': water.is_watertight,
+                'size_mb': round(fp.stat().st_size / 1024 / 1024, 2),
+                'order': 0, 'description': 'Water base layer (blue)',
+            })
+            logger.info(f"  Water: {len(water.faces)} faces")
+
+    # ── Layer 2: Buildings with shell ──
+    _progress(15, "Building buildings layer (boolean union)...")
+    footprints = []
+    if building_meshes:
+        terrain_bounds_for_filter = None
+        if terrain_meshes:
+            t_merged = trimesh.util.concatenate(terrain_meshes) if len(terrain_meshes) > 1 else terrain_meshes[0]
+            terrain_bounds_for_filter = (t_merged.bounds[0], t_merged.bounds[1])
+        footprints = _get_building_footprints_2d(building_meshes, terrain_bounds=terrain_bounds_for_filter)
+        buildings = _create_buildings_layer(building_meshes, terrain_y_min, shell_thickness)
+        if buildings is not None and len(buildings.faces) > 0:
+            buildings = _assign_solid_color(buildings, V2_COLORS['buildings'])
+            if scale != 1.0:
+                buildings.apply_scale(scale)
+            fp = out / f"{name}_buildings.ply"
+            buildings.export(str(fp), file_type='ply')
+            results.append({
+                'layer': 'buildings', 'file': fp.name,
+                'color_rgb': V2_COLORS['buildings'],
+                'faces': len(buildings.faces), 'vertices': len(buildings.vertices),
+                'watertight': buildings.is_watertight,
+                'size_mb': round(fp.stat().st_size / 1024 / 1024, 2),
+                'order': 1, 'description': 'Buildings on thin shell (white) — fits under terrain',
+            })
+            logger.info(f"  Buildings: {len(buildings.faces)} faces, watertight={buildings.is_watertight}")
+
+    # ── Layer 3: Terrain with holes ──
+    _progress(45, "Building terrain layer (punching holes)...")
+    if terrain_meshes:
+        terrain = _create_terrain_with_holes(terrain_meshes, footprints, terrain_thickness)
+        if terrain is not None and len(terrain.faces) > 0:
+            terrain = _assign_solid_color(terrain, V2_COLORS['terrain'])
+            if scale != 1.0:
+                terrain.apply_scale(scale)
+            fp = out / f"{name}_terrain.ply"
+            terrain.export(str(fp), file_type='ply')
+            results.append({
+                'layer': 'terrain', 'file': fp.name,
+                'color_rgb': V2_COLORS['terrain'],
+                'faces': len(terrain.faces), 'vertices': len(terrain.vertices),
+                'watertight': terrain.is_watertight,
+                'size_mb': round(fp.stat().st_size / 1024 / 1024, 2),
+                'order': 2, 'description': 'Terrain with building holes (green) — fits over buildings',
+            })
+            logger.info(f"  Terrain: {len(terrain.faces)} faces, watertight={terrain.is_watertight}")
+
+    # ── Layer 4: Roads ──
+    _progress(75, "Building roads layer...")
+    if road_meshes:
+        roads = trimesh.util.concatenate(road_meshes) if len(road_meshes) > 1 else road_meshes[0].copy()
+        roads = _solidify_surface(roads, thickness=1.0)
+        roads = _make_watertight(roads)
+        if roads is not None and len(roads.faces) > 0:
+            roads = _assign_solid_color(roads, V2_COLORS['roads'])
+            if scale != 1.0:
+                roads.apply_scale(scale)
+            fp = out / f"{name}_roads.ply"
+            roads.export(str(fp), file_type='ply')
+            results.append({
+                'layer': 'roads', 'file': fp.name,
+                'color_rgb': V2_COLORS['roads'],
+                'faces': len(roads.faces), 'vertices': len(roads.vertices),
+                'watertight': roads.is_watertight,
+                'size_mb': round(fp.stat().st_size / 1024 / 1024, 2),
+                'order': 3, 'description': 'Roads and bridges (gray) — sits on terrain',
+            })
+            logger.info(f"  Roads: {len(roads.faces)} faces")
+
+    # ── Write manifest ──
+    elapsed = time.perf_counter() - t0
+    manifest = {
+        'name': name,
+        'version': 'v2',
+        'source_glb': str(glb_path),
+        'scale': scale,
+        'layers': sorted(results, key=lambda x: x['order']),
+        'total_faces': sum(r['faces'] for r in results),
+        'total_vertices': sum(r['vertices'] for r in results),
+        'elapsed_seconds': round(elapsed, 1),
+        'print_notes': {
+            'layer_order': 'Water (bottom) → Buildings → Terrain (drops over buildings) → Roads (top)',
+            'interlocking': 'Terrain has building-shaped holes; buildings poke through from below',
+            'assembly': 'Print each layer flat, then stack: water base, buildings+shell, terrain over buildings, roads on terrain',
+            'tolerance': f'{HOLE_TOLERANCE}m clearance on building holes',
+        },
+    }
+    manifest_path = out / 'manifest.json'
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f, indent=2)
+
+    _progress(100, "V2 layers complete!")
+    logger.info(f"Generated {len(results)} V2 layers in {elapsed:.1f}s")
+
+    return {
+        'layers': results,
+        'manifest_path': str(manifest_path),
+        'output_dir': str(out),
+    }
